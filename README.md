@@ -71,9 +71,9 @@ bash
 
 python3 -m venv venv
 source venv/bin/activate   # En Windows: venv\Scripts\activate
-
-Instalar dependencias
-bash
+```
+### Instalar dependencias
+```bash
 
 pip install -r requirements.txt
 
@@ -82,24 +82,25 @@ text
 
 dnspython>=2.0
 rich>=13.0
+```
+## 🚀 Uso
 
-🚀 Uso
 Sintaxis básica
-bash
+```bash
 
 python pishTracker.py <dominio-objetivo> [max_variantes]
 
     <dominio-objetivo>: dominio a analizar (obligatorio, debe incluir TLD, p. ej. example.com).
 
     [max_variantes]: número máximo de variantes a generar (opcional, por defecto 1000).
-
-Ejemplo
-bash
+```
+## Ejemplo
+```bash
 
 python pishTracker.py example.com
-
-Salida esperada:
-text
+```
+### Salida esperada:
+```text
 
         ____  _     _      _     _____               _             
        |  _ \| |   (_)    | |   |_   _|             | |            
@@ -119,8 +120,9 @@ Se generaron 432 variaciones.
 [Tabla en vivo con los resultados...]
 
 Al finalizar, se mostrará una tabla final y se generará el archivo phish_report.json.
-📄 Ejemplo de reporte JSON
-json
+```
+### 📄 Ejemplo de reporte JSON
+```json
 
 {
   "summary": {
@@ -158,23 +160,26 @@ json
     }
   ]
 }
-
-🧩 Estructura del proyecto
-text
+```
+## 🧩 Estructura del proyecto
+```text
 
 phish-tracker/
 ├── pishTracker.py          # Código principal
 ├── requirements.txt        # Dependencias
 ├── README.md               # Documentación
 └── phish_report.json       # Reporte generado (tras ejecución)
-
+```
 El código está organizado en clases:
-Clase	Responsabilidad
-TyposquatEngine	Genera todas las variaciones de dominio según técnicas configuradas.
-DNSChecker	Realiza consultas DNS asíncronas (A y MX) con concurrencia limitada.
-TUIConsole	Maneja la interfaz Rich (tablas en vivo, paneles, colores).
-PhishTracker	Orquesta el flujo completo: generación, análisis, visualización y exportación.
-🔍 Casos de uso en Threat Intelligence
+
+  Clase	Responsabilidad
+
+    TyposquatEngine	Genera todas las variaciones de dominio según técnicas configuradas.
+    DNSChecker	Realiza consultas DNS asíncronas (A y MX) con concurrencia limitada.
+    TUIConsole	Maneja la interfaz Rich (tablas en vivo, paneles, colores).
+    PhishTracker	Orquesta el flujo completo: generación, análisis, visualización y exportación.
+
+### 🔍 Casos de uso en Threat Intelligence
 
     Monitoreo continuo de marca: programa ejecuciones periódicas (cron, CI/CD) para detectar nuevos dominios sospechosos que imiten tu marca.
 
@@ -184,7 +189,7 @@ PhishTracker	Orquesta el flujo completo: generación, análisis, visualización 
 
     Enriquecimiento de feeds: integra el JSON generado en tu SIEM o plataforma de inteligencia para correlacionar con otros indicadores.
 
-⚠️ Advertencia ética y legal
+### ⚠️ Advertencia ética y legal
 
 Esta herramienta está destinada exclusivamente para:
 
@@ -208,7 +213,7 @@ Guía rápida
 
     Envía un pull request.
 
-📝 Licencia
+### 📝 Licencia
 
 Distribuido bajo la licencia MIT. Consulta el archivo LICENSE para más detalles.
 🙏 Agradecimientos
