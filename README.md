@@ -115,7 +115,7 @@ Si solo quieres la funcionalidad básica, puedes instalar únicamente `rich` y `
 ### Sintaxis básica
 
 ```bash
-python main.py <dominio-objetivo> [opciones]
+python phishTracker.py <dominio-objetivo> [opciones]
 ```
 
 ### Opciones disponibles
@@ -134,7 +134,7 @@ python main.py <dominio-objetivo> [opciones]
 Consulta la ayuda completa (generada automáticamente por `argparse`) en cualquier momento con:
 
 ```bash
-python main.py -h
+python phishTracker.py -h
 ```
 
 ### Ejemplos
@@ -142,25 +142,25 @@ python main.py -h
 Análisis básico:
 
 ```bash
-python main.py example.com
+python phishTracker.py example.com
 ```
 
 Análisis completo con detección de registros recientes e infraestructura adicional:
 
 ```bash
-python main.py example.com --whois --crtsh
+python phishTracker.py example.com --whois --crtsh
 ```
 
 Escaneo más rápido y agresivo, con resolutores propios:
 
 ```bash
-python main.py example.com --max-variants 500 --concurrency 200 --nameservers 1.1.1.1,8.8.8.8
+python phishTracker.py example.com --max-variants 500 --concurrency 200 --nameservers 1.1.1.1,8.8.8.8
 ```
 
 Guardar el reporte con un nombre personalizado:
 
 ```bash
-python main.py example.com --output reportes/example_2026
+python phishTracker.py example.com --output reportes/example_2026
 ```
 
 ### Salida esperada
@@ -261,7 +261,7 @@ El archivo `phish_report.csv` contiene las mismas columnas (`domain`, `technique
 
 ```text
 phish-tracker/
-├── main.py                 # Código principal
+├── phishTracker.py          # Código principal
 ├── requirements.txt         # Dependencias (núcleo + opcionales)
 ├── README.md                 # Documentación
 ├── phish_report.json        # Reporte JSON generado (tras ejecución)
