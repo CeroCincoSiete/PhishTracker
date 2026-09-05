@@ -1,2 +1,8 @@
-dnspython>=2.0
-rich>=13.0
+# Núcleo (obligatorio)
+rich>=13.7.0
+dnspython>=2.6.0
+
+# Opcionales — la herramienta funciona sin ellos, mostrando un aviso
+tldextract>=5.1.0      # manejo correcto de TLDs compuestos (co.uk, com.ar...)
+python-whois>=0.9.4    # habilita --whois (antigüedad de registro)
+aiohttp>=3.9.0          # habilita --crtsh (Certificate Transparency)
