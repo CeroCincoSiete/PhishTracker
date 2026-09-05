@@ -1,35 +1,71 @@
 #!/usr/bin/env python3
 """
 Phish-Tracker // Threat Intel & Typosquatting Watcher
-A production-grade tool for detecting typosquatted domains and phishing infrastructure.
+Herramienta de consola para detectar dominios typosquatted y posible
+infraestructura de phishing que suplante a un dominio/marca objetivo.
+
+Uso básico:
+    python main.py ejemplo.com
+
+Opciones útiles:
+    python main.py ejemplo.com --max-variants 500 --concurrency 150
+    python main.py ejemplo.com --whois          # verifica antigüedad de registro
+    python main.py ejemplo.com --crtsh          # busca en Certificate Transparency
+    python main.py ejemplo.com --nameservers 1.1.1.1,8.8.8.8
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
+import csv
 import json
+import signal
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 import dns.asyncresolver
 import dns.resolver
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, MofNCompleteColumn
 from rich import box
-from rich.align import Align
-from rich.text import Text
-from rich.layout import Layout
+
+try:
+    import tldextract  # Manejo correcto de TLDs compuestos (co.uk, com.ar, etc.)
+    # Forzar uso exclusivo del snapshot local incluido en el paquete: nunca debe
+    # intentar descargar la lista de sufijos públicos por red (esta herramienta
+    # suele correr en redes restringidas/aisladas de pentesting).
+    _tldextractor = tldextract.TLDExtract(suffix_list_urls=())
+    _HAS_TLDEXTRACT = True
+except ImportError:
+    _HAS_TLDEXTRACT = False
+
+try:
+    import whois as whois_lib  # python-whois, opcional
+    _HAS_WHOIS = True
+except ImportError:
+    _HAS_WHOIS = False
+
+try:
+    import aiohttp  # Para consulta opcional a crt.sh
+    _HAS_AIOHTTP = True
+except ImportError:
+    _HAS_AIOHTTP = False
+
 
 # ----------------------------------------------------------------------
-# Configuration and constants
+# Configuración y constantes
 # ----------------------------------------------------------------------
-MAX_VARIANTS = 1000  # Hard limit to prevent API abuse and performance degradation
-CONCURRENT_DNS_QUERIES = 100
-DNS_TIMEOUT = 3.0  # seconds
+MAX_VARIANTS_DEFAULT = 1000
+CONCURRENT_DNS_QUERIES_DEFAULT = 100
+DNS_TIMEOUT_DEFAULT = 3.0
+WHOIS_CONCURRENCY = 10          # WHOIS es mucho más lento/rate-limited que DNS
+RECENTLY_REGISTERED_DAYS = 30   # umbral para marcar "recién registrado" como sospechoso
 
-# Homoglyph mapping (character substitutions)
 HOMOGLYPHS = {
     'a': ['4', '@'],
     'b': ['8', '6'],
@@ -44,183 +80,220 @@ HOMOGLYPHS = {
     'z': ['2'],
 }
 
-# Common phishing keywords to append/prepend
-PHISHING_KEYWORDS = ['login', 'verify', 'portal', 'update', 'secure', 'account']
+PHISHING_KEYWORDS = ['login', 'verify', 'portal', 'update', 'secure', 'account', 'support', 'signin']
+
+# TLDs comunes usados para "TLD swapping" en campañas reales de phishing
+COMMON_TLDS = ['com', 'net', 'org', 'info', 'biz', 'co', 'io', 'me',
+               'xyz', 'online', 'site', 'top', 'cc', 'shop', 'live']
+
 
 # ----------------------------------------------------------------------
-# Data classes
+# Modelos de datos
 # ----------------------------------------------------------------------
 @dataclass
 class DomainVariant:
     domain: str
-    status: str = "pending"  # pending, checking, available, registered, critical, high
+    technique: str = "unknown"
+    status: str = "pending"          # pending, checking, available, high, critical, error
     ip: Optional[str] = None
     mx_servers: List[str] = field(default_factory=list)
     risk_level: str = "UNKNOWN"
     error: Optional[str] = None
+    created_date: Optional[str] = None
+    days_since_registration: Optional[int] = None
+    recently_registered: bool = False
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.domain
 
+    # Orden de severidad para ordenar tablas/reportes
+    _SEVERITY = {"critical": 0, "high": 1, "error": 3, "checking": 4, "pending": 5, "available": 6}
+
+    @property
+    def severity(self) -> int:
+        return self._SEVERITY.get(self.status, 9)
+
 
 # ----------------------------------------------------------------------
-# Typosquatting Engine
+# Motor de Typosquatting
 # ----------------------------------------------------------------------
 class TyposquatEngine:
-    """Generates domain variations based on common typosquatting techniques."""
+    """Genera variaciones de dominio típicas de typosquatting, priorizadas
+    de más a menos realistas para que el truncado por max_variants no
+    descarte primero las variantes más relevantes."""
 
-    def __init__(self, target_domain: str, max_variants: int = MAX_VARIANTS):
-        self.target_domain = target_domain.lower()
+    def __init__(self, target_domain: str, max_variants: int = MAX_VARIANTS_DEFAULT):
+        self.target_domain = target_domain.lower().strip()
         self.max_variants = max_variants
-        # Split into base and TLD (assume last dot separates)
-        parts = self.target_domain.split('.')
+        self.base, self.tld = self._split_domain(self.target_domain)
+        if not self.base:
+            raise ValueError("Dominio inválido: no se pudo extraer la parte base")
+        # Cada técnica aporta una lista ordenada de (dominio, técnica).
+        # El orden entre técnicas define la prioridad de conservación al truncar.
+        self._seen: Set[str] = {self.target_domain}
+
+    def _split_domain(self, domain: str) -> Tuple[str, str]:
+        """Separa base y TLD. Usa tldextract si está disponible para manejar
+        TLDs compuestos (ej. empresa.co.uk); si no, cae al método simple."""
+        if _HAS_TLDEXTRACT:
+            ext = _tldextractor(domain)
+            if ext.domain and ext.suffix:
+                return ext.domain, ext.suffix
+        parts = domain.split('.')
         if len(parts) < 2:
-            raise ValueError("Invalid domain: must contain at least one dot")
-        self.base = '.'.join(parts[:-1])
-        self.tld = parts[-1]
-        self.variants: Set[str] = set()
+            raise ValueError("El dominio debe incluir un TLD (ej. example.com)")
+        return '.'.join(parts[:-1]), parts[-1]
 
     def generate(self) -> List[DomainVariant]:
-        """Generate all variations, deduplicate, and cap at max_variants."""
-        self._generate_omissions()
-        self._generate_insertions()
-        self._generate_transpositions()
-        self._generate_homoglyphs()
-        self._generate_keyword_suffixes()
+        """Genera variantes priorizadas y las trunca a max_variants."""
+        ordered: List[Tuple[str, str]] = []
+        # Prioridad alta: patrones más usados en campañas reales de phishing
+        ordered += self._gen_keyword_suffixes()
+        ordered += self._gen_tld_swap()
+        ordered += self._gen_homoglyphs()
+        ordered += self._gen_transpositions()
+        ordered += self._gen_omissions()
+        # Prioridad baja: combinatoria más ruidosa
+        ordered += self._gen_insertions()
 
-        # Limit
-        variants_list = list(self.variants)
-        if len(variants_list) > self.max_variants:
-            variants_list = variants_list[:self.max_variants]
+        # Deduplicar conservando el primer orden de aparición (= prioridad)
+        deduped: List[Tuple[str, str]] = []
+        seen_domains: Set[str] = set()
+        for domain, technique in ordered:
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            deduped.append((domain, technique))
 
-        # Convert to DomainVariant objects
-        return [DomainVariant(domain=v) for v in sorted(variants_list)]
+        if len(deduped) > self.max_variants:
+            deduped = deduped[: self.max_variants]
 
-    def _add_variant(self, base: str):
-        """Add a variant if valid and not the original."""
+        variants = [DomainVariant(domain=d, technique=t) for d, t in deduped]
+        variants.sort(key=lambda v: v.domain)
+        return variants
+
+    def _valid(self, base: str) -> Optional[str]:
         if not base or base == self.base:
-            return
+            return None
         domain = f"{base}.{self.tld}"
-        if domain != self.target_domain:
-            self.variants.add(domain)
+        if domain in self._seen:
+            return None
+        return domain
 
-    def _generate_omissions(self):
-        """Delete each character once."""
-        base = self.base
-        for i in range(len(base)):
-            new_base = base[:i] + base[i+1:]
-            self._add_variant(new_base)
+    def _gen_keyword_suffixes(self) -> List[Tuple[str, str]]:
+        out = []
+        for kw in PHISHING_KEYWORDS:
+            for candidate in (f"{self.base}-{kw}", f"{kw}-{self.base}", f"{self.base}{kw}"):
+                d = self._valid(candidate)
+                if d:
+                    out.append((d, "keyword"))
+        return out
 
-    def _generate_insertions(self):
-        """Insert common characters near each position."""
-        base = self.base
-        common_chars = 'abcdefghijklmnopqrstuvwxyz0123456789-_'
-        for i in range(len(base) + 1):
-            for ch in common_chars:
-                new_base = base[:i] + ch + base[i:]
-                self._add_variant(new_base)
+    def _gen_tld_swap(self) -> List[Tuple[str, str]]:
+        out = []
+        for tld in COMMON_TLDS:
+            if tld == self.tld:
+                continue
+            domain = f"{self.base}.{tld}"
+            if domain != self.target_domain:
+                out.append((domain, "tld_swap"))
+        return out
 
-    def _generate_transpositions(self):
-        """Swap adjacent characters."""
-        base = self.base
-        for i in range(len(base) - 1):
-            new_base = base[:i] + base[i+1] + base[i] + base[i+2:]
-            self._add_variant(new_base)
-
-    def _generate_homoglyphs(self):
-        """Replace characters with visually similar ones."""
+    def _gen_homoglyphs(self) -> List[Tuple[str, str]]:
+        out = []
         base = self.base
         for i, char in enumerate(base):
-            if char in HOMOGLYPHS:
-                for replacement in HOMOGLYPHS[char]:
-                    new_base = base[:i] + replacement + base[i+1:]
-                    self._add_variant(new_base)
+            for repl in HOMOGLYPHS.get(char, []):
+                d = self._valid(base[:i] + repl + base[i + 1:])
+                if d:
+                    out.append((d, "homoglyph"))
+        return out
 
-    def _generate_keyword_suffixes(self):
-        """Append and prepend common phishing keywords."""
+    def _gen_transpositions(self) -> List[Tuple[str, str]]:
+        out = []
         base = self.base
-        for keyword in PHISHING_KEYWORDS:
-            # suffix: base-keyword
-            self._add_variant(f"{base}-{keyword}")
-            # prefix: keyword-base
-            self._add_variant(f"{keyword}-{base}")
+        for i in range(len(base) - 1):
+            d = self._valid(base[:i] + base[i + 1] + base[i] + base[i + 2:])
+            if d:
+                out.append((d, "transposition"))
+        return out
+
+    def _gen_omissions(self) -> List[Tuple[str, str]]:
+        out = []
+        base = self.base
+        for i in range(len(base)):
+            d = self._valid(base[:i] + base[i + 1:])
+            if d:
+                out.append((d, "omission"))
+        return out
+
+    def _gen_insertions(self) -> List[Tuple[str, str]]:
+        out = []
+        base = self.base
+        common_chars = 'abcdefghijklmnopqrstuvwxyz0123456789-'
+        for i in range(len(base) + 1):
+            for ch in common_chars:
+                d = self._valid(base[:i] + ch + base[i:])
+                if d:
+                    out.append((d, "insertion"))
+        return out
 
 
 # ----------------------------------------------------------------------
-# DNS Checker (Asynchronous)
+# DNS Checker (asíncrono)
 # ----------------------------------------------------------------------
 class DNSChecker:
-    """Performs asynchronous DNS lookups for A and MX records."""
+    """Realiza resoluciones DNS asíncronas (A y MX) con control de concurrencia."""
 
-    def __init__(self, concurrency: int = CONCURRENT_DNS_QUERIES, timeout: float = DNS_TIMEOUT):
+    def __init__(self, concurrency: int, timeout: float, nameservers: Optional[List[str]] = None):
         self.semaphore = asyncio.Semaphore(concurrency)
-        self.timeout = timeout
         self.resolver = dns.asyncresolver.Resolver()
         self.resolver.timeout = timeout
         self.resolver.lifetime = timeout
+        if nameservers:
+            self.resolver.nameservers = nameservers
 
     async def check_domain(self, variant: DomainVariant) -> None:
-        """Update the DomainVariant with DNS results."""
         async with self.semaphore:
             variant.status = "checking"
             try:
-                # Check A record
+                ips: List[str] = []
                 has_a = False
-                ips = []
                 try:
                     answers_a = await self.resolver.resolve(variant.domain, 'A')
-                    ips = [str(rdata) for rdata in answers_a]
+                    ips = [str(r) for r in answers_a]
                     has_a = True
-                except dns.resolver.NXDOMAIN:
-                    # Domain does not exist
+                except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
                     variant.status = "available"
                     variant.risk_level = "DISPONIBLE"
                     return
                 except dns.resolver.NoAnswer:
-                    pass  # No A record, but domain may exist
-                except dns.resolver.NoNameservers:
-                    variant.status = "available"
-                    variant.risk_level = "DISPONIBLE"
-                    return
+                    pass
                 except Exception:
-                    # Other DNS errors: treat as unavailable for our purposes
                     variant.status = "available"
                     variant.risk_level = "DISPONIBLE"
                     return
 
-                # Check MX record
+                mx_servers: List[str] = []
                 has_mx = False
-                mx_servers = []
                 try:
                     answers_mx = await self.resolver.resolve(variant.domain, 'MX')
-                    mx_servers = [str(rdata.exchange) for rdata in answers_mx]
+                    mx_servers = [str(r.exchange) for r in answers_mx]
                     has_mx = True
-                except dns.resolver.NoAnswer:
-                    pass
-                except dns.resolver.NoNameservers:
-                    pass
                 except Exception:
                     pass
 
-                # Determine risk
                 if has_a and has_mx:
-                    variant.status = "critical"
-                    variant.risk_level = "CRÍTICO"
-                    variant.ip = ips[0] if ips else None
-                    variant.mx_servers = mx_servers
+                    variant.status, variant.risk_level = "critical", "CRÍTICO"
+                    variant.ip, variant.mx_servers = ips[0] if ips else None, mx_servers
                 elif has_a:
-                    variant.status = "high"
-                    variant.risk_level = "ALTO"
+                    variant.status, variant.risk_level = "high", "ALTO"
                     variant.ip = ips[0] if ips else None
                 elif has_mx:
-                    # Domain exists with MX but no A: still considered high risk
-                    variant.status = "high"
-                    variant.risk_level = "ALTO"
+                    variant.status, variant.risk_level = "high", "ALTO"
                     variant.mx_servers = mx_servers
                 else:
-                    # Domain exists but no A/MX? Rare, treat as available.
-                    variant.status = "available"
-                    variant.risk_level = "DISPONIBLE"
+                    variant.status, variant.risk_level = "available", "DISPONIBLE"
 
             except Exception as e:
                 variant.status = "error"
@@ -229,233 +302,407 @@ class DNSChecker:
 
 
 # ----------------------------------------------------------------------
-# Rich TUI Console
+# WHOIS Checker (opcional) — antigüedad de registro
+# ----------------------------------------------------------------------
+class WhoisChecker:
+    """Consulta WHOIS solo para dominios ya confirmados como registrados
+    (has A o MX), ya que WHOIS es lento y a menudo tiene rate limiting."""
+
+    def __init__(self, concurrency: int = WHOIS_CONCURRENCY):
+        self.semaphore = asyncio.Semaphore(concurrency)
+
+    async def enrich(self, variant: DomainVariant) -> None:
+        if not _HAS_WHOIS:
+            return
+        if variant.status not in ("high", "critical"):
+            return
+        async with self.semaphore:
+            loop = asyncio.get_running_loop()
+            try:
+                data = await loop.run_in_executor(None, whois_lib.whois, variant.domain)
+                created = data.creation_date
+                if isinstance(created, list):
+                    created = created[0] if created else None
+                if created:
+                    from datetime import datetime, timezone
+                    if created.tzinfo is None:
+                        now = datetime.now()
+                    else:
+                        now = datetime.now(timezone.utc)
+                    days = (now - created).days
+                    variant.created_date = str(created)
+                    variant.days_since_registration = days
+                    if days is not None and days <= RECENTLY_REGISTERED_DAYS:
+                        variant.recently_registered = True
+                        if variant.risk_level == "ALTO":
+                            variant.risk_level = "ALTO (registro reciente)"
+                        elif variant.risk_level == "CRÍTICO":
+                            variant.risk_level = "CRÍTICO (registro reciente)"
+            except Exception:
+                # WHOIS falla frecuentemente (rate limit, formatos raros): no debe romper el flujo
+                pass
+
+
+# ----------------------------------------------------------------------
+# Certificate Transparency Checker (opcional) — crt.sh
+# ----------------------------------------------------------------------
+class CertTransparencyChecker:
+    """Busca en los logs públicos de Certificate Transparency (crt.sh)
+    dominios reales (no generados por typosquatting) que tengan certificados
+    SSL emitidos mencionando la marca/base del objetivo. Esto detecta
+    infraestructura de phishing que no necesariamente es un typosquat obvio."""
+
+    URL = "https://crt.sh/?q=%25{query}%25&output=json"
+
+    async def search(self, base: str, legit_domain: str, timeout: float = 10.0) -> List[str]:
+        if not _HAS_AIOHTTP:
+            return []
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.URL.format(query=base), timeout=timeout) as resp:
+                    if resp.status != 200:
+                        return []
+                    text = await resp.text()
+                    try:
+                        rows = json.loads(text)
+                    except json.JSONDecodeError:
+                        return []
+        except Exception:
+            return []
+
+        found: Set[str] = set()
+        for row in rows:
+            name_value = row.get("name_value", "")
+            for name in name_value.split("\n"):
+                name = name.strip().lower().lstrip("*.")
+                if name and name != legit_domain and not name.endswith("." + legit_domain):
+                    found.add(name)
+        return sorted(found)
+
+
+# ----------------------------------------------------------------------
+# TUI (Rich)
 # ----------------------------------------------------------------------
 class TUIConsole:
-    """Handles Rich rendering and live updates."""
+    """Renderiza la vista en vivo (optimizada: solo lo relevante + progreso
+    global) y las tablas finales."""
 
-    def __init__(self):
-        self.console = Console()
+    def __init__(self, console: Console):
+        self.console = console
         self.results: List[DomainVariant] = []
+        self.total = 0
+        self.progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]Escaneando dominios..."),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        )
+        self.progress_task_id = None
         self.live: Optional[Live] = None
-        self.display_task: Optional[asyncio.Task] = None
+
+    def set_results(self, results: List[DomainVariant]):
+        self.results = results
+        self.total = len(results)
+        self.progress_task_id = self.progress.add_task("scan", total=self.total)
+
+    def _style_for(self, variant: DomainVariant) -> str:
+        return {
+            "critical": "bold red",
+            "high": "bold yellow",
+            "available": "green",
+            "error": "red",
+            "checking": "cyan",
+        }.get(variant.status, "white")
+
+    def _build_table(self, variants: List[DomainVariant], title: str) -> Table:
+        table = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold cyan", show_lines=False)
+        table.add_column("Dominio", style="white", no_wrap=True)
+        table.add_column("Técnica", style="dim")
+        table.add_column("Estado", justify="center", style="bold")
+        table.add_column("IP", style="magenta")
+        table.add_column("MX", style="blue")
+        table.add_column("Registrado", style="dim")
+        table.add_column("Riesgo", justify="center", style="bold")
+
+        for v in variants:
+            table.add_row(
+                v.domain,
+                v.technique,
+                v.status.upper(),
+                v.ip or "—",
+                ", ".join(v.mx_servers) if v.mx_servers else "—",
+                (v.created_date[:10] if v.created_date else "—"),
+                v.risk_level if v.risk_level != "UNKNOWN" else "—",
+                style=self._style_for(v),
+            )
+        return table
+
+    def _renderable(self) -> Group:
+        done = sum(1 for v in self.results if v.status not in ("pending", "checking"))
+        self.progress.update(self.progress_task_id, completed=done)
+
+        interesting = [v for v in self.results if v.status in ("critical", "high")]
+        interesting.sort(key=lambda v: v.severity)
+        table = self._build_table(interesting[:25], "Hallazgos de riesgo (en vivo)")
+
+        counts = self._counts()
+        summary = Panel(
+            f"[bold]Analizadas:[/] {done}/{self.total}   "
+            f"[bold red]Crítico:[/] {counts['critical']}   "
+            f"[bold yellow]Alto:[/] {counts['high']}   "
+            f"[green]Disponible:[/] {counts['available']}   "
+            f"[red]Error:[/] {counts['error']}",
+            border_style="cyan",
+        )
+        return Group(self.progress, summary, table)
+
+    def _counts(self) -> dict:
+        c = {"critical": 0, "high": 0, "available": 0, "error": 0}
+        for v in self.results:
+            if v.status in c:
+                c[v.status] += 1
+        return c
 
     def start_live(self):
-        """Initialize the Live context with an initial empty table."""
-        self.live = Live(self._generate_table(), console=self.console, refresh_per_second=10)
+        self.live = Live(self._renderable(), console=self.console, refresh_per_second=8)
         self.live.start()
 
+    def refresh(self):
+        if self.live:
+            self.live.update(self._renderable())
+
     def stop_live(self):
-        """Stop the Live context."""
         if self.live:
             self.live.stop()
 
-    def update_results(self, results: List[DomainVariant]):
-        """Update the internal results list."""
-        self.results = results
-
-    def _generate_table(self) -> Table:
-        """Create a Rich Table showing all variants and their status."""
-        table = Table(title="Análisis de Variaciones de Dominio", box=box.SIMPLE_HEAVY,
-                      header_style="bold cyan", show_lines=False)
-        table.add_column("Dominio", style="white", no_wrap=True)
-        table.add_column("Estado", justify="center", style="bold")
-        table.add_column("IP", style="magenta")
-        table.add_column("Servidores MX", style="blue")
-        table.add_column("Riesgo", justify="center", style="bold")
-
-        for variant in self.results:
-            # Determine style based on status/risk
-            style = "white"
-            if variant.status == "critical":
-                style = "bold red"
-            elif variant.status == "high":
-                style = "bold yellow"
-            elif variant.status == "available":
-                style = "green"
-            elif variant.status == "error":
-                style = "red"
-            elif variant.status == "checking":
-                style = "cyan"
-            # pending -> default
-
-            ip_str = variant.ip if variant.ip else "—"
-            mx_str = ", ".join(variant.mx_servers) if variant.mx_servers else "—"
-            risk_str = variant.risk_level if variant.risk_level != "UNKNOWN" else "—"
-
-            table.add_row(
-                variant.domain,
-                variant.status.upper(),
-                ip_str,
-                mx_str,
-                risk_str,
-                style=style
-            )
-
-        return table
-
-    async def display_loop(self, update_interval: float = 0.2):
-        """Periodically update the Live table."""
+    async def display_loop(self, interval: float = 0.25):
         while True:
-            if self.live:
-                self.live.update(self._generate_table())
-            await asyncio.sleep(update_interval)
+            self.refresh()
+            await asyncio.sleep(interval)
 
 
 # ----------------------------------------------------------------------
-# Main orchestrator
+# Orquestador principal
 # ----------------------------------------------------------------------
 class PhishTracker:
-    """Main application class."""
-
-    def __init__(self, target_domain: str, max_variants: int = MAX_VARIANTS):
-        self.target_domain = target_domain
-        self.engine = TyposquatEngine(target_domain, max_variants)
-        self.checker = DNSChecker()
-        self.tui = TUIConsole()
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.target_domain = args.domain
+        self.console = Console()
+        self.engine = TyposquatEngine(self.target_domain, args.max_variants)
+        nameservers = args.nameservers.split(",") if args.nameservers else None
+        self.checker = DNSChecker(args.concurrency, args.timeout, nameservers)
+        self.whois_checker = WhoisChecker() if args.whois else None
+        self.crtsh_checker = CertTransparencyChecker() if args.crtsh else None
+        self.tui = TUIConsole(self.console)
         self.results: List[DomainVariant] = []
-        self.shutdown_event = asyncio.Event()
+        self.crtsh_hits: List[str] = []
+        self._interrupted = False
+
+    def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop):
+        def _handler():
+            self._interrupted = True
+            self.console.print("\n[bold yellow]⚠ Interrupción recibida. Cancelando tareas pendientes...[/]")
+        try:
+            loop.add_signal_handler(signal.SIGINT, _handler)
+        except NotImplementedError:
+            # add_signal_handler no está disponible en algunas plataformas (ej. Windows)
+            pass
 
     async def run(self):
-        """Execute the full workflow."""
-        # Print banner
         self._print_banner()
 
-        # Generate variations
-        self.tui.console.print("[bold cyan]Generando variaciones...[/]")
+        if not _HAS_TLDEXTRACT:
+            self.console.print("[dim]Sugerencia: instala 'tldextract' para manejar TLDs compuestos (co.uk, com.ar, etc.)[/]")
+        if self.args.whois and not _HAS_WHOIS:
+            self.console.print("[yellow]Aviso: --whois solicitado pero 'python-whois' no está instalado. Se omitirá.[/]")
+        if self.args.crtsh and not _HAS_AIOHTTP:
+            self.console.print("[yellow]Aviso: --crtsh solicitado pero 'aiohttp' no está instalado. Se omitirá.[/]")
+
+        self.console.print("[bold cyan]Generando variaciones...[/]")
         self.results = self.engine.generate()
         if not self.results:
-            self.tui.console.print("[bold red]No se generaron variaciones.[/]")
+            self.console.print("[bold red]No se generaron variaciones.[/]")
             return
+        self.console.print(f"[green]Se generaron {len(self.results)} variaciones (de un espacio combinatorio mayor, priorizadas).[/]\n")
 
-        self.tui.console.print(f"[green]Se generaron {len(self.results)} variaciones.[/]\n")
+        loop = asyncio.get_running_loop()
+        self._install_signal_handlers(loop)
 
-        # Start Live display
-        self.tui.update_results(self.results)
+        self.tui.set_results(self.results)
         self.tui.start_live()
-        # Start the display loop as a background task
-        self.tui.display_task = asyncio.create_task(self.tui.display_loop())
+        display_task = asyncio.create_task(self.tui.display_loop())
 
-        # Run DNS checks concurrently
-        tasks = [asyncio.create_task(self.checker.check_domain(variant)) for variant in self.results]
-        # Wait for all tasks to complete, but allow interruption
+        dns_tasks = [asyncio.create_task(self.checker.check_domain(v)) for v in self.results]
         try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        except KeyboardInterrupt:
-            self.tui.console.print("\n[bold yellow]Interrupción recibida. Cancelando consultas...[/]")
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*dns_tasks, return_exceptions=True)
+
+            if self.whois_checker and not self._interrupted:
+                whois_tasks = [asyncio.create_task(self.whois_checker.enrich(v)) for v in self.results
+                               if v.status in ("high", "critical")]
+                if whois_tasks:
+                    self.tui.progress.update(self.tui.progress_task_id, description="Consultando WHOIS...")
+                    await asyncio.gather(*whois_tasks, return_exceptions=True)
         finally:
-            # Stop display loop and Live
-            if self.tui.display_task:
-                self.tui.display_task.cancel()
-                try:
-                    await self.tui.display_task
-                except asyncio.CancelledError:
-                    pass
+            display_task.cancel()
+            try:
+                await display_task
+            except asyncio.CancelledError:
+                pass
             self.tui.stop_live()
 
-        # Show final table
-        self.tui.console.print(self.tui._generate_table())
+        if self.crtsh_checker and not self._interrupted:
+            self.console.print("[bold cyan]Consultando Certificate Transparency (crt.sh)...[/]")
+            self.crtsh_hits = await self.crtsh_checker.search(self.engine.base, self.target_domain)
 
-        # Generate and export report
-        self._export_report()
+        self._print_final_report()
+        self._export(self.args.output)
 
     def _print_banner(self):
-        """Display ASCII art and title."""
         ascii_art = r"""
-        ____  _     _      _     _____               _             
-       |  _ \| |   (_)    | |   |_   _|             | |            
-       | |_) | |__  _ ___ | |__   | |_ __ __ _  ___| | _____ _ __ 
+        ____  _     _      _     _____               _
+       |  _ \| |   (_)    | |   |_   _|             | |
+       | |_) | |__  _ ___ | |__   | |_ __ __ _  ___| | _____ _ __
        |  __/| '_ \| / __|| '_ \  | | '__/ _` |/ __| |/ / _ \ '__|
-       | |   | | | | \__ \| | | | | | | | (_| | (__|   <  __/ |   
-       |_|   |_| |_|_|___/|_| |_| |_|_|  \__,_|\___|_|\_\___|_|   
+       | |   | | | | \__ \| | | | | | | | (_| | (__|   <  __/ |
+       |_|   |_| |_|_|___/|_| |_| |_|_|  \__,_|\___|_|\_\___|_|
         """
-        self.tui.console.print(ascii_art, style="bold red")
-        self.tui.console.print(Panel.fit(
+        self.console.print(ascii_art, style="bold red")
+        self.console.print(Panel.fit(
             "[bold cyan]PHISH-TRACKER // Threat Intel & Typosquatting Watcher[/]\n"
-            f"[bold]Objetivo:[/] {self.target_domain}",
-            border_style="red",
-            padding=(1, 2)
+            f"[bold]Objetivo:[/] {self.target_domain}\n"
+            f"[bold]Máx. variantes:[/] {self.args.max_variants}   "
+            f"[bold]Concurrencia:[/] {self.args.concurrency}   "
+            f"[bold]Timeout:[/] {self.args.timeout}s",
+            border_style="red", padding=(1, 2),
         ))
-        self.tui.console.print()
+        self.console.print()
 
-    def _export_report(self):
-        """Generate JSON report and save to file."""
+    def _print_final_report(self):
+        registered = [v for v in self.results if v.status in ("high", "critical")]
+        registered.sort(key=lambda v: v.severity)
+        if registered:
+            self.console.print(self.tui._build_table(registered, "Dominios registrados (riesgo ALTO/CRÍTICO)"))
+        else:
+            self.console.print("[green]No se encontraron dominios registrados en riesgo.[/]")
+
+        if self.crtsh_checker:
+            if self.crtsh_hits:
+                self.console.print(Panel(
+                    "\n".join(self.crtsh_hits[:30]) + (f"\n... y {len(self.crtsh_hits) - 30} más" if len(self.crtsh_hits) > 30 else ""),
+                    title=f"⚠ Certificados SSL sospechosos hallados en crt.sh ({len(self.crtsh_hits)})",
+                    border_style="red",
+                ))
+            else:
+                self.console.print("[dim]crt.sh: no se hallaron certificados adicionales sospechosos.[/]")
+
+        counts = self.tui._counts()
+        self.console.print(Panel(
+            f"[bold]Total analizadas:[/] {len(self.results)}\n"
+            f"[bold]Registradas (ALTO+CRÍTICO):[/] {counts['high'] + counts['critical']}\n"
+            f"[bold red]En riesgo CRÍTICO:[/] {counts['critical']}\n"
+            f"[bold yellow]En riesgo ALTO:[/] {counts['high']}\n"
+            f"[green]Disponibles:[/] {counts['available']}\n"
+            f"[red]Errores:[/] {counts['error']}\n"
+            f"[bold]Recién registrados (<{RECENTLY_REGISTERED_DAYS}d):[/] "
+            f"{sum(1 for v in self.results if v.recently_registered)}",
+            title="Informe Final", border_style="cyan",
+        ))
+
+    def _export(self, output_prefix: str):
         summary = {
             "target_domain": self.target_domain,
             "total_variants": len(self.results),
             "registered": sum(1 for r in self.results if r.status in ("high", "critical")),
             "critical": sum(1 for r in self.results if r.status == "critical"),
+            "high": sum(1 for r in self.results if r.status == "high"),
             "available": sum(1 for r in self.results if r.status == "available"),
             "errors": sum(1 for r in self.results if r.status == "error"),
+            "recently_registered": sum(1 for r in self.results if r.recently_registered),
         }
-
         report = {
             "summary": summary,
+            "certificate_transparency_hits": self.crtsh_hits,
             "results": [
                 {
                     "domain": r.domain,
+                    "technique": r.technique,
                     "status": r.status,
                     "ip": r.ip,
                     "mx_servers": r.mx_servers,
                     "risk_level": r.risk_level,
-                    "error": r.error
+                    "created_date": r.created_date,
+                    "days_since_registration": r.days_since_registration,
+                    "recently_registered": r.recently_registered,
+                    "error": r.error,
                 }
                 for r in self.results
-            ]
+            ],
         }
 
-        filename = "phish_report.json"
-        with open(filename, "w", encoding="utf-8") as f:
+        json_path = f"{output_prefix}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 
-        self.tui.console.print(f"\n[bold green]Reporte exportado a {filename}[/]")
-        # Print summary
-        self.tui.console.print(Panel(
-            f"[bold]Resumen:[/]\n"
-            f"Total analizadas: {summary['total_variants']}\n"
-            f"Registradas (ALTO+CRÍTICO): {summary['registered']}\n"
-            f"En riesgo CRÍTICO: {summary['critical']}\n"
-            f"Disponibles: {summary['available']}\n"
-            f"Errores: {summary['errors']}",
-            title="Informe Final",
-            border_style="cyan"
-        ))
+        csv_path = f"{output_prefix}.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["domain", "technique", "status", "risk_level", "ip", "mx_servers",
+                              "created_date", "days_since_registration", "recently_registered", "error"])
+            for r in self.results:
+                writer.writerow([r.domain, r.technique, r.status, r.risk_level, r.ip or "",
+                                  ";".join(r.mx_servers), r.created_date or "",
+                                  r.days_since_registration or "", r.recently_registered, r.error or ""])
+
+        self.console.print(f"\n[bold green]Reporte exportado a {json_path} y {csv_path}[/]")
 
 
 # ----------------------------------------------------------------------
-# Entry point
+# CLI / Entry point
 # ----------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="phish-tracker",
+        description="Detecta dominios typosquatted y posible infraestructura de phishing.",
+    )
+    parser.add_argument("domain", help="Dominio objetivo, ej. example.com")
+    parser.add_argument("--max-variants", type=int, default=MAX_VARIANTS_DEFAULT,
+                         help=f"Máximo de variantes a analizar (default: {MAX_VARIANTS_DEFAULT})")
+    parser.add_argument("--concurrency", type=int, default=CONCURRENT_DNS_QUERIES_DEFAULT,
+                         help=f"Consultas DNS concurrentes (default: {CONCURRENT_DNS_QUERIES_DEFAULT})")
+    parser.add_argument("--timeout", type=float, default=DNS_TIMEOUT_DEFAULT,
+                         help=f"Timeout DNS en segundos (default: {DNS_TIMEOUT_DEFAULT})")
+    parser.add_argument("--nameservers", type=str, default=None,
+                         help="Lista de nameservers separados por coma, ej. 1.1.1.1,8.8.8.8")
+    parser.add_argument("--whois", action="store_true",
+                         help="Consulta WHOIS en dominios registrados para detectar registros recientes (más lento)")
+    parser.add_argument("--crtsh", action="store_true",
+                         help="Busca en Certificate Transparency (crt.sh) infraestructura adicional")
+    parser.add_argument("--output", type=str, default="phish_report",
+                         help="Prefijo de los archivos de salida (default: phish_report -> .json/.csv)")
+    return parser.parse_args()
+
+
+def validate_domain(domain: str) -> str:
+    domain = domain.strip().lower()
+    if not domain or '.' not in domain or domain.startswith('.') or domain.endswith('.'):
+        print("Error: el dominio debe tener un formato válido (ej. example.com)")
+        sys.exit(1)
+    return domain
+
+
 async def main():
-    if len(sys.argv) < 2:
-        print("Uso: python main.py <dominio-objetivo> [max_variantes]")
-        sys.exit(1)
-
-    target = sys.argv[1].strip().lower()
-    # Basic validation
-    if '.' not in target:
-        print("Error: el dominio debe incluir TLD (ej. example.com)")
-        sys.exit(1)
-
-    max_variants = MAX_VARIANTS
-    if len(sys.argv) >= 3:
-        try:
-            max_variants = int(sys.argv[2])
-        except ValueError:
-            print("El número máximo de variantes debe ser un entero.")
-            sys.exit(1)
-
-    tracker = PhishTracker(target, max_variants)
-    try:
-        await tracker.run()
-    except KeyboardInterrupt:
-        # Clean exit on Ctrl+C
-        print("\n[!] Interrupción del usuario. Saliendo...")
-        sys.exit(0)
+    args = parse_args()
+    args.domain = validate_domain(args.domain)
+    tracker = PhishTracker(args)
+    await tracker.run()
 
 
 if __name__ == "__main__":
-    # Usar asyncio.run para manejar correctamente el event loop en Python 3.12+
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[!] Interrupción del usuario. Saliendo...")
+        sys.exit(0)
